@@ -26,6 +26,8 @@ Implemented endpoints:
 - `DELETE /files/:session_id/:fileId`
 - `GET /health`
 
+`GET /health` is intentionally unauthenticated so it can be used by container/platform health checks.
+
 ## Run with Docker
 
 ```bash

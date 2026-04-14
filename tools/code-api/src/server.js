@@ -97,6 +97,10 @@ const hasBinary = async (bin, args) =>
   });
 
 const auth = (req, res, next) => {
+  if (req.path === '/health') {
+    return next();
+  }
+
   if (!API_KEY) {
     return res.status(503).json({ error: 'Service unavailable', details: 'CODE_API_KEY is not configured' });
   }
