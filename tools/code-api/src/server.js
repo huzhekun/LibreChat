@@ -248,6 +248,7 @@ const spawnSandbox = ({ cmd, cwd }) =>
       [
         '--die-with-parent',
         '--unshare-pid',
+        '--unshare-user',
         '--unshare-uts',
         '--unshare-ipc',
         ...networkArgs,
