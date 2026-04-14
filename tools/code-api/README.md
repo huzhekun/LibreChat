@@ -5,8 +5,9 @@ This is a drop-in, self-hosted replacement for LibreChat's hosted code interpret
 ## Security/isolation model
 
 - **No docker-in-docker**: all code runs as child processes inside this container.
-- **Process isolation**: each `/exec` call runs in a separate process group with hard timeout and basic `ulimit` controls.
-- **Directory isolation**: each session has an isolated workspace under `DATA_ROOT/sessions/<session_id>/workspace`.
+- **Sandbox execution**: `/exec` runs inside a `bubblewrap` sandbox with PID/IPC/UTS namespaces, hard timeout, and `ulimit` controls.
+- **Hard security requirement**: if `bwrap` is unavailable, `/exec` returns `503` (no insecure fallback mode).
+- **Directory isolation**: each session has an isolated workspace under `DATA_ROOT/sessions/<session_id>/workspace`, mounted as `/mnt/data` inside the sandbox.
 - **Attribution model**:
   - API key auth via `x-api-key`.
   - User identity sourced from `User-Id` header (or `user_id` body fallback).
@@ -64,3 +65,14 @@ If you cannot inject that env var, you can patch the default hosted URL at conta
 
 - Runtime support depends on installed compilers/interpreters in the image.
 - `memory` and `cpu_time` in response are currently returned as `null`.
+- `SANDBOX_NETWORK_MODE=isolated` (default) uses `--unshare-net` to disable sandbox network access.
+- `SANDBOX_NETWORK_MODE=shared` keeps host/container networking shared with sandboxed code.
+
+## Network hardening (internal network protection)
+
+`bubblewrap` alone cannot do "internet-only" filtering. If you need outbound internet while blocking internal ranges, use one of these patterns:
+
+1. Opt into `SANDBOX_NETWORK_MODE=shared`, and enforce egress policy at container/host firewall level (drop RFC1918, link-local, ULA, metadata IPs).
+2. Route all sandbox traffic through an authenticated egress proxy or gateway that deny-lists internal CIDRs and only allows approved domains/ports.
+
+In short: **use external network controls for internet-only access**; use `SANDBOX_NETWORK_MODE=none` for strongest local isolation.
