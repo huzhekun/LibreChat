@@ -18,6 +18,9 @@ const DATA_ROOT = process.env.DATA_ROOT || path.resolve(__dirname, '../data');
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 150 * 1024 * 1024);
 const EXEC_TIMEOUT_MS = Number(process.env.EXEC_TIMEOUT_MS || 20_000);
 const MAX_OUTPUT_BYTES = Number(process.env.MAX_OUTPUT_BYTES || 1 * 1024 * 1024);
+const SANDBOX_UID = Number(process.env.SANDBOX_UID || 10001);
+const SANDBOX_GID = Number(process.env.SANDBOX_GID || 10001);
+const SANDBOX_NETWORK_MODE = (process.env.SANDBOX_NETWORK_MODE || 'isolated').toLowerCase();
 
 const app = express();
 app.use(cors());
@@ -238,11 +241,52 @@ const collectWorkspaceFiles = async (sessionId) => {
 const spawnSandbox = ({ cmd, cwd }) =>
   new Promise((resolve) => {
     const shellCmd = `ulimit -t 20 -v 1048576 -f 20480; ${cmd}`;
-    const child = spawn('bash', ['-c', shellCmd], {
-      cwd,
-      detached: true,
-      env: { ...process.env, HOME: cwd, TMPDIR: cwd },
-    });
+    const usesSharedNetwork = SANDBOX_NETWORK_MODE === 'shared';
+    const networkArgs = usesSharedNetwork ? ['--share-net'] : ['--unshare-net'];
+    const child = spawn(
+      'bwrap',
+      [
+        '--die-with-parent',
+        '--unshare-pid',
+        '--unshare-uts',
+        '--unshare-ipc',
+        ...networkArgs,
+        '--new-session',
+        '--ro-bind',
+        '/',
+        '/',
+        '--tmpfs',
+        '/tmp',
+        '--bind',
+        cwd,
+        '/mnt/data',
+        '--chdir',
+        '/mnt/data',
+        '--proc',
+        '/proc',
+        '--dev',
+        '/dev',
+        '--setenv',
+        'HOME',
+        '/mnt/data',
+        '--setenv',
+        'TMPDIR',
+        '/tmp',
+        '--uid',
+        String(SANDBOX_UID),
+        '--gid',
+        String(SANDBOX_GID),
+        '--',
+        'bash',
+        '-lc',
+        shellCmd,
+      ],
+      {
+        cwd,
+        detached: true,
+        env: { ...process.env },
+      },
+    );
 
     let stdout = '';
     let stderr = '';
@@ -472,6 +516,14 @@ app.post('/exec', async (req, res) => {
   }
 
   const languageConfig = languageMap[lang];
+  const hasBwrap = await hasBinary('bwrap', ['--version']);
+  if (!hasBwrap) {
+    return res.status(503).json({
+      error: 'Service unavailable',
+      details: 'Sandbox runtime unavailable: bwrap is required',
+    });
+  }
+
   const isAvailable = await hasBinary(languageConfig.version[0], languageConfig.version[1]);
   if (!isAvailable) {
     return res.status(503).json({
@@ -515,5 +567,10 @@ app.post('/exec', async (req, res) => {
 
 app.listen(PORT, async () => {
   await ensureDir(DATA_ROOT);
+  if (SANDBOX_NETWORK_MODE !== 'shared' && SANDBOX_NETWORK_MODE !== 'none' && SANDBOX_NETWORK_MODE !== 'isolated') {
+    console.warn(
+      `[code-api] unknown SANDBOX_NETWORK_MODE="${SANDBOX_NETWORK_MODE}", defaulting to isolated network namespace`,
+    );
+  }
   console.log(`[code-api] listening on :${PORT}`);
 });
