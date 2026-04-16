@@ -5,9 +5,9 @@ This is a drop-in, self-hosted replacement for LibreChat's hosted code interpret
 ## Security/isolation model
 
 - **No docker-in-docker**: all code runs as child processes inside this container.
-- **Sandbox execution**: `/exec` runs inside a `bubblewrap` sandbox with PID/IPC/UTS namespaces, hard timeout, and `ulimit` controls.
-- **Hard security requirement**: if `bwrap` is unavailable, `/exec` returns `503` (no insecure fallback mode).
-- **Directory isolation**: each session has an isolated workspace under `DATA_ROOT/sessions/<session_id>/workspace`, mounted as `/mnt/data` inside the sandbox.
+- **Sandbox execution**: `/exec` uses `SANDBOX_BACKEND=landlock` by default, running code as `SANDBOX_UID:SANDBOX_GID` with a Landlock filesystem allowlist, hard timeout, and `ulimit` controls.
+- **Optional bubblewrap backend**: `SANDBOX_BACKEND=bwrap` keeps the older PID/IPC/UTS namespace sandbox for hosts that permit nested user/mount namespaces.
+- **Directory isolation**: each session has an isolated workspace under `DATA_ROOT/sessions/<session_id>/workspace`, available as `/mnt/data` inside the sandbox.
 - **Attribution model**:
   - API key auth via `x-api-key`.
   - User identity sourced from `User-Id` header (or `user_id` body fallback).
@@ -39,6 +39,50 @@ docker run -d --name librechat-code-api \
   -e CODE_API_KEY=change-me \
   -v librechat-code-data:/var/lib/librechat-code-api \
   librechat-code-api
+```
+
+## Landlock backend
+
+`SANDBOX_BACKEND=landlock` is intended for Kubernetes environments where nested
+mount namespaces are blocked. It does not need `CAP_SYS_ADMIN` or a container
+host socket. Instead, a small native launcher applies a Landlock filesystem
+policy, drops to `SANDBOX_UID:SANDBOX_GID`, and runs the command.
+
+Landlock does not remap paths, so the server serializes Landlock executions and
+temporarily points `/mnt/data` at the active session workspace while that command
+runs. Code can read/write the active session workspace, while reads of app files
+and sibling session workspaces are denied by Landlock.
+
+Limitations:
+
+- Landlock is filesystem access control, not a PID or mount namespace.
+- `/mnt/data` compatibility is serialized for safety, so concurrent `/exec`
+  requests run one at a time with this backend.
+- Runtime/toolchain directories such as `/usr/bin`, `/usr/lib`, and
+  `/usr/include` are readable so interpreters and compilers can run.
+- The node kernel must support Landlock. If it does not, `/exec` fails with
+  `code-landlock: Landlock is unavailable on this kernel`.
+
+With Podman on SELinux/AppArmor-confined hosts, `bubblewrap` may be blocked from
+creating its nested mount namespace and fail with `bwrap: Failed to make / slave:
+Permission denied`. If that happens, start the container with the host security
+label disabled for this container:
+
+```bash
+podman run -d --name librechat-code-api \
+  --security-opt label=disable \
+  -p 3085:3085 \
+  -e CODE_API_KEY=change-me \
+  -v librechat-code-data:/var/lib/librechat-code-api \
+  docker.io/zhekunhu/librechat-code-api:0.0.9
+```
+
+If the error persists, the host is blocking nested user/mount namespaces for this
+container. Confirm with:
+
+```bash
+podman exec --user 10001:10001 librechat-code-api \
+  bwrap --unshare-user --unshare-pid --ro-bind / / --tmpfs /tmp -- bash -lc 'id'
 ```
 
 Then configure LibreChat:

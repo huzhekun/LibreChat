@@ -21,6 +21,8 @@ const MAX_OUTPUT_BYTES = Number(process.env.MAX_OUTPUT_BYTES || 1 * 1024 * 1024)
 const SANDBOX_UID = Number(process.env.SANDBOX_UID || 10001);
 const SANDBOX_GID = Number(process.env.SANDBOX_GID || 10001);
 const SANDBOX_NETWORK_MODE = (process.env.SANDBOX_NETWORK_MODE || 'isolated').toLowerCase();
+const SANDBOX_BACKEND = (process.env.SANDBOX_BACKEND || 'landlock').toLowerCase();
+const LANDLOCK_MNT_DATA = process.env.LANDLOCK_MNT_DATA || '/mnt/data';
 
 const app = express();
 app.use(cors());
@@ -238,7 +240,217 @@ const collectWorkspaceFiles = async (sessionId) => {
   return files;
 };
 
-const spawnSandbox = ({ cmd, cwd }) =>
+const chownPath = async (target) => {
+  try {
+    await fs.chown(target, SANDBOX_UID, SANDBOX_GID);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+};
+
+const prepareSandboxWorkspace = async (dir) => {
+  await chownPath(dir);
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const target = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      try {
+        await fs.lchown(target, SANDBOX_UID, SANDBOX_GID);
+      } catch (err) {
+        if (err?.code !== 'ENOENT') {
+          throw err;
+        }
+      }
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      await prepareSandboxWorkspace(target);
+      continue;
+    }
+
+    await chownPath(target);
+  }
+};
+
+const isBwrapSetupError = (stderr) =>
+  /bwrap: (Failed to make \/ slave|Creating new namespace failed|setting up uid map|Specifying --uid requires)/.test(stderr);
+
+const runtimeReadOnlyPaths = [
+  '/bin',
+  '/usr/bin',
+  '/usr/include',
+  '/usr/lib',
+  '/usr/lib64',
+  '/lib',
+  '/lib64',
+  '/etc/alternatives',
+  '/etc/ld.so.conf.d',
+  '/etc/ssl',
+  '/etc/ca-certificates',
+  '/etc/java-17-openjdk',
+  '/etc/R',
+];
+
+let landlockQueue = Promise.resolve();
+
+const withLandlockDataLink = async (cwd, fn) => {
+  const previous = landlockQueue;
+  let release;
+  landlockQueue = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+
+  try {
+    await ensureDir(path.dirname(LANDLOCK_MNT_DATA));
+    try {
+      const existing = await fs.lstat(LANDLOCK_MNT_DATA);
+      if (existing.isSymbolicLink()) {
+        await fs.unlink(LANDLOCK_MNT_DATA);
+      } else {
+        throw new Error(`${LANDLOCK_MNT_DATA} exists and is not a symlink`);
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        throw err;
+      }
+    }
+
+    await fs.symlink(cwd, LANDLOCK_MNT_DATA);
+    return await fn();
+  } finally {
+    try {
+      const existing = await fs.lstat(LANDLOCK_MNT_DATA);
+      if (existing.isSymbolicLink()) {
+        await fs.unlink(LANDLOCK_MNT_DATA);
+      }
+    } catch {
+      // Best effort cleanup. A later exec will refuse to overwrite a non-symlink.
+    }
+    release();
+  }
+};
+
+const runChildWithOutputLimit = ({ bin, args, cwd, env }) =>
+  new Promise((resolve) => {
+    const child = spawn(bin, args, {
+      cwd,
+      detached: true,
+      env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let outBytes = 0;
+    let errBytes = 0;
+
+    const start = process.hrtime.bigint();
+
+    const appendWithLimit = (chunk, current, byteCounter) => {
+      const text = chunk.toString('utf8');
+      const incoming = Buffer.byteLength(text);
+      if (byteCounter >= MAX_OUTPUT_BYTES) {
+        return { text: current, bytes: byteCounter };
+      }
+
+      const remaining = MAX_OUTPUT_BYTES - byteCounter;
+      const clipped = incoming > remaining ? text.slice(0, remaining) : text;
+      return { text: current + clipped, bytes: byteCounter + Buffer.byteLength(clipped) };
+    };
+
+    child.stdout.on('data', (chunk) => {
+      const next = appendWithLimit(chunk, stdout, outBytes);
+      stdout = next.text;
+      outBytes = next.bytes;
+    });
+
+    child.stderr.on('data', (chunk) => {
+      const next = appendWithLimit(chunk, stderr, errBytes);
+      stderr = next.text;
+      errBytes = next.bytes;
+    });
+
+    let killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    }, EXEC_TIMEOUT_MS);
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      const end = process.hrtime.bigint();
+      const wallTime = Number(end - start) / 1_000_000_000;
+      resolve({
+        stdout,
+        stderr,
+        code,
+        signal: killed ? 'SIGKILL' : signal,
+        wallTime,
+        status: killed ? 'timeout' : code === 0 ? 'completed' : 'error',
+      });
+    });
+
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({
+        stdout,
+        stderr: `${stderr}\n${error.message}`,
+        code: null,
+        signal: null,
+        wallTime: 0,
+        status: 'error',
+      });
+    });
+  });
+
+const spawnLandlock = async ({ cmd, cwd }) => {
+  const tmpDir = path.join(cwd, '.tmp');
+  await ensureDir(tmpDir);
+  await prepareSandboxWorkspace(cwd);
+
+  return withLandlockDataLink(cwd, async () => {
+    const shellCmd = `ulimit -t 20 -v 1048576 -f 20480; ${cmd}`;
+    const args = [
+      '--uid',
+      String(SANDBOX_UID),
+      '--gid',
+      String(SANDBOX_GID),
+      '--rw',
+      cwd,
+      '--rw',
+      tmpDir,
+      '--rw',
+      LANDLOCK_MNT_DATA,
+    ];
+
+    for (const roPath of runtimeReadOnlyPaths) {
+      args.push('--ro', roPath);
+    }
+
+    args.push('--', 'bash', '--noprofile', '--norc', '-lc', shellCmd);
+
+    return runChildWithOutputLimit({
+      bin: 'code-landlock',
+      args,
+      cwd,
+      env: {
+        ...process.env,
+        HOME: cwd,
+        TMPDIR: tmpDir,
+      },
+    });
+  });
+};
+
+const runBwrap = ({ cmd, cwd, userNamespaceArgs }) =>
   new Promise((resolve) => {
     const shellCmd = `ulimit -t 20 -v 1048576 -f 20480; ${cmd}`;
     const usesSharedNetwork = SANDBOX_NETWORK_MODE === 'shared';
@@ -247,6 +459,7 @@ const spawnSandbox = ({ cmd, cwd }) =>
       'bwrap',
       [
         '--die-with-parent',
+        ...userNamespaceArgs,
         '--unshare-pid',
         '--unshare-uts',
         '--unshare-ipc',
@@ -255,6 +468,8 @@ const spawnSandbox = ({ cmd, cwd }) =>
         '--ro-bind',
         '/',
         '/',
+        '--tmpfs',
+        '/mnt',
         '--tmpfs',
         '/tmp',
         '--bind',
@@ -272,12 +487,10 @@ const spawnSandbox = ({ cmd, cwd }) =>
         '--setenv',
         'TMPDIR',
         '/tmp',
-        '--uid',
-        String(SANDBOX_UID),
-        '--gid',
-        String(SANDBOX_GID),
         '--',
         'bash',
+        '--noprofile',
+        '--norc',
         '-lc',
         shellCmd,
       ],
@@ -285,6 +498,8 @@ const spawnSandbox = ({ cmd, cwd }) =>
         cwd,
         detached: true,
         env: { ...process.env },
+        gid: SANDBOX_GID,
+        uid: SANDBOX_UID,
       },
     );
 
@@ -356,6 +571,52 @@ const spawnSandbox = ({ cmd, cwd }) =>
     });
   });
 
+const spawnBwrap = async ({ cmd, cwd }) => {
+  const attempts = [
+    { label: '--unshare-user', userNamespaceArgs: ['--unshare-user'] },
+    { label: '--unshare-user-try', userNamespaceArgs: ['--unshare-user-try'] },
+    { label: 'implicit-userns', userNamespaceArgs: [] },
+  ];
+  const failures = [];
+
+  for (const attempt of attempts) {
+    const result = await runBwrap({ cmd, cwd, userNamespaceArgs: attempt.userNamespaceArgs });
+    if (!isBwrapSetupError(result.stderr)) {
+      return result;
+    }
+    failures.push(`${attempt.label}: ${result.stderr.trim()}`);
+  }
+
+  const lastFailure = failures[failures.length - 1] || 'unknown bwrap setup failure';
+  return {
+    stdout: '',
+    stderr: `bwrap setup failed after ${attempts.length} attempts\n${failures.join('\n') || lastFailure}\n`,
+    code: 1,
+    signal: null,
+    wallTime: 0,
+    status: 'error',
+  };
+};
+
+const spawnSandbox = async ({ cmd, cwd }) => {
+  if (SANDBOX_BACKEND === 'landlock') {
+    return spawnLandlock({ cmd, cwd });
+  }
+
+  if (SANDBOX_BACKEND === 'bwrap') {
+    return spawnBwrap({ cmd, cwd });
+  }
+
+  return {
+    stdout: '',
+    stderr: `Unsupported SANDBOX_BACKEND="${SANDBOX_BACKEND}". Use "landlock" or "bwrap".\n`,
+    code: 1,
+    signal: null,
+    wallTime: 0,
+    status: 'error',
+  };
+};
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
@@ -366,13 +627,18 @@ app.post('/upload', upload.any(), async (req, res) => {
     return res.status(400).json({ error: 'Invalid entity_id' });
   }
 
+  const requestedSessionId = req.body.session_id;
+  if (requestedSessionId && !idRegex.test(requestedSessionId)) {
+    return res.status(400).json({ error: 'Invalid session_id' });
+  }
+
   const files = req.files || [];
   if (!files.length) {
     return res.status(400).json({ error: 'No files uploaded' });
   }
 
   const userId = actorId(req);
-  const { sessionId } = await ensureSession({ entityId, userId });
+  const { sessionId } = await ensureSession({ requestedSessionId, entityId, userId });
   const stored = await Promise.all(files.map((file) => storeUpload({ sessionId, uploadedFile: file })));
 
   return res.json({
@@ -516,11 +782,16 @@ app.post('/exec', async (req, res) => {
   }
 
   const languageConfig = languageMap[lang];
-  const hasBwrap = await hasBinary('bwrap', ['--version']);
-  if (!hasBwrap) {
+  const hasSandboxRuntime =
+    SANDBOX_BACKEND === 'landlock'
+      ? await hasBinary('code-landlock', ['--help'])
+      : SANDBOX_BACKEND === 'bwrap'
+        ? await hasBinary('bwrap', ['--version'])
+        : false;
+  if (!hasSandboxRuntime) {
     return res.status(503).json({
       error: 'Service unavailable',
-      details: 'Sandbox runtime unavailable: bwrap is required',
+      details: `Sandbox runtime unavailable for SANDBOX_BACKEND=${SANDBOX_BACKEND}`,
     });
   }
 
@@ -534,6 +805,7 @@ app.post('/exec', async (req, res) => {
 
   const src = path.join(workspacePath(sessionId), languageConfig.source);
   await fs.writeFile(src, code, 'utf8');
+  await prepareSandboxWorkspace(workspacePath(sessionId));
 
   const result = await spawnSandbox({ cmd: languageConfig.run(args), cwd: workspacePath(sessionId) });
   const emittedFiles = await collectWorkspaceFiles(sessionId);
